@@ -1,0 +1,134 @@
+name: Build original XeSS PR for MO2
+
+on:
+  push:
+    paths:
+      - '.github/workflows/build-xess.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout original PR head without merging dev
+        uses: actions/checkout@v4
+        with:
+          repository: NightHammer1000/skyrim-community-shaders
+          ref: 9cd53ce033a2817ddfc66aa627b63fc62872600c
+          submodules: recursive
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify source and SDK
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force evidence | Out-Null
+          $head = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $head.Trim() -ne '9cd53ce033a2817ddfc66aa627b63fc62872600c') { throw 'Unexpected source commit' }
+          $subs = git submodule status --recursive
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot read submodules' }
+          $subs | Tee-Object evidence/submodules.txt
+          if ($subs | Where-Object { $_ -match '^[-+U]' }) { throw 'Submodule checkout mismatch' }
+          $sdk = git -C extern/XeSS-SDK rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $sdk.Trim() -ne '8fe81bdbbaf00b3c1b733fd0d830c333dc84e6f0') { throw 'Unexpected XeSS SDK commit' }
+          foreach ($dll in @('libxess.dll','libxess_dx11.dll','libxess_fg.dll','libxell.dll')) {
+            $a = Get-FileHash "extern/XeSS-SDK/bin/$dll" -Algorithm SHA256
+            $b = Get-FileHash "features/Upscaling/Shaders/Upscaling/XeSS/$dll" -Algorithm SHA256
+            if ($a.Hash -ne $b.Hash) { throw "SDK DLL mismatch: $dll" }
+          }
+          "Source: $head; XeSS SDK v3.0.2: $sdk; no dev merge; no source patches" | Set-Content evidence/source.txt
+
+      - name: Setup original MSVC and vcpkg environment
+        uses: ./.github/actions/setup-build-environment
+        with:
+          cache-key-suffix: xess-original-9cd53ce
+          cmake-preset: ALL
+          build-dir: build/ALL
+
+      - name: Configure original Release preset
+        run: |
+          cmake --preset ALL 2>&1 | Tee-Object evidence/configure.log
+          if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
+
+      - name: Compile CommunityShaders using MSVC
+        run: |
+          cmake --build build/ALL --config Release --target CommunityShaders --parallel 2 2>&1 | Tee-Object evidence/build.log
+          if ($LASTEXITCODE -ne 0) { throw 'MSVC compilation failed' }
+
+      - name: Install complete AIO content
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP 'CommunityShaders-XeSS-MO2'
+          cmake --install build/ALL --config Release --prefix "$stage" 2>&1 | Tee-Object evidence/install.log
+          if ($LASTEXITCODE -ne 0) { throw 'CMake install failed' }
+          "MO2_STAGE=$stage" >> $env:GITHUB_ENV
+
+      - name: Validate package and create MO2 ZIP
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = $env:MO2_STAGE
+          $required = @(
+            'SKSE/Plugins/CommunityShaders.dll',
+            'Shaders/Features/Upscaling.ini',
+            'Shaders/Features/HDRDisplay.ini',
+            'Shaders/Upscaling/XeSS/libxess.dll',
+            'Shaders/Upscaling/XeSS/libxess_dx11.dll',
+            'Shaders/Upscaling/XeSS/libxess_fg.dll',
+            'Shaders/Upscaling/XeSS/libxell.dll'
+          )
+          foreach ($relative in $required) {
+            $p = Join-Path $stage $relative
+            if (!(Test-Path $p -PathType Leaf) -or (Get-Item $p).Length -eq 0) { throw "Missing package file: $relative" }
+          }
+          foreach ($dll in @('libxess.dll','libxess_dx11.dll','libxess_fg.dll','libxell.dll')) {
+            if ((Get-FileHash "$stage/Shaders/Upscaling/XeSS/$dll").Hash -ne (Get-FileHash "extern/XeSS-SDK/bin/$dll").Hash) { throw "Packaged SDK mismatch: $dll" }
+          }
+          if (!(Get-ChildItem "$stage/Shaders" -Recurse -Filter '*.hlsl')) { throw 'No HLSL shaders packaged' }
+          $plugin = "$stage/SKSE/Plugins/CommunityShaders.dll"
+          & dumpbin /headers "$plugin" | Tee-Object evidence/plugin-headers.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Invalid plugin PE' }
+          & dumpbin /dependents "$plugin" | Tee-Object evidence/plugin-dependents.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect DLL dependencies' }
+          if (!(Select-String -Path evidence/plugin-headers.txt -Pattern '8664 machine')) { throw 'Plugin is not x64' }
+          Get-ChildItem $stage -Recurse -File | ForEach-Object {
+            [pscustomobject]@{Path=[IO.Path]::GetRelativePath($stage,$_.FullName); Bytes=$_.Length; SHA256=(Get-FileHash $_.FullName -Algorithm SHA256).Hash}
+          } | Export-Csv evidence/package-manifest.csv -NoTypeInformation
+          New-Item -ItemType Directory -Force dist-mo2 | Out-Null
+          $zip = Join-Path $PWD 'dist-mo2/CommunityShaders-XeSS-PR2704-9cd53ce-MO2.zip'
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [IO.Compression.ZipFile]::CreateFromDirectory($stage,$zip,[IO.Compression.CompressionLevel]::Optimal,$false)
+          $archive = [IO.Compression.ZipFile]::OpenRead($zip)
+          try {
+            $names = @($archive.Entries | ForEach-Object { $_.FullName.Replace('\','/') })
+            foreach ($relative in $required) {
+              if ($names -notcontains $relative) { throw "Wrong ZIP layout: $relative" }
+            }
+            if ($archive.Entries.Count -ne @(Get-ChildItem $stage -Recurse -File).Count) { throw 'ZIP file count mismatch' }
+            $names | Set-Content evidence/zip-contents.txt
+          } finally { $archive.Dispose() }
+          Get-FileHash $zip -Algorithm SHA256 | Format-List | Out-File evidence/zip-sha256.txt
+          "Compilation and ZIP structure validated. Skyrim runtime, shader runtime compilation, XeSS-FG and XeLL on ONEXPLAYER 3 / Arc B390 remain untested." | Set-Content evidence/VALIDATION.txt
+
+      - name: Upload installable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: CommunityShaders-XeSS-MO2
+          path: dist-mo2/*.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload build and packaging evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-evidence
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 30
