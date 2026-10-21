@@ -41,6 +41,8 @@ jobs:
           New-Item -ItemType Directory -Force evidence | Out-Null
           python _harness/port/merge-xess.py 2>&1 | Tee-Object evidence/merge.log
           if ($LASTEXITCODE -ne 0) { throw 'Pinned merge failed' }
+          python -c 'from pathlib import Path; files = ["src/Hooks.cpp", "src/Features/Upscaling.cpp", "src/Features/Upscaling/IntelXeSSFrameGeneration.cpp", "src/Features/Upscaling/IntelXeSSFrameGeneration.h", "_harness/fixes/fg-lifecycle.patch"]; [Path(f).write_text(Path(f).read_text(encoding="utf-8"), encoding="utf-8", newline="\n") for f in files]'
+          if ($LASTEXITCODE -ne 0) { throw 'Line-ending normalization failed' }
           git apply --check _harness/fixes/fg-lifecycle.patch
           if ($LASTEXITCODE -ne 0) { throw 'FG patch does not apply' }
           git apply _harness/fixes/fg-lifecycle.patch
