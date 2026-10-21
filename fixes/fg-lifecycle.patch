@@ -1,0 +1,102 @@
+--- a/src/Features/Upscaling/IntelXeSSFrameGeneration.cpp
++++ b/src/Features/Upscaling/IntelXeSSFrameGeneration.cpp
+@@ -729,12 +729,12 @@
+ 
+ bool IntelXeSSFrameGeneration::BeginFrame()
+ {
+-	uint64_t fallback = 0;
+-	{
+-		std::scoped_lock lock(mutex_);
+-		fallback = fallbackGlobalsFrame_;
+-	}
+-	return BeginFrame(GetGlobalsFrame(fallback));
++	std::unique_lock lock(mutex_);
++	// One sequence per actual render/present, independent of the input/global
++	// counter (which can advance during Present or stay unchanged in menus).
++	if (frameStage_ != FrameStage::Idle)
++		return true;
++	return StartFrameUnlocked(lock, nextPresentId_);
+ }
+ 
+ bool IntelXeSSFrameGeneration::BeginFrame(uint64_t globalsFrame)
+@@ -753,11 +753,9 @@
+ 
+ 	bool success = true;
+ 	if (frameStage_ != FrameStage::Idle) {
+-		if (!warnedIncompleteFrame_) {
+-			warnedIncompleteFrame_ = true;
+-			logger::warn("[XeSS-FG] A new game frame started before the previous XeLL marker sequence completed; closing it safely");
+-		}
+-		success &= CompleteOpenFrameUnlocked();
++		// Never synthesize PRESENT_END for a Present that is still executing.
++		// Preserve its ID, resource tags and markers until AfterPresent owns it.
++		return false;
+ 	}
+ 
+ 	lastGlobalsFrame_ = globalsFrame;
+@@ -767,10 +765,9 @@
+ 	taggedThisFrame_ = false;
+ 	inputSampleSent_ = false;
+ 
+-	// xellSleep blocks the caller until the pacing deadline. BeginFrame runs on the game's
+-	// input/main thread while TagFrame, BeforePresent and AfterPresent take this same mutex on
+-	// the render/present thread, so holding it here would turn a main-thread frame cap into a
+-	// render-thread stall. Release it for the sleep only.
++	// Pacing now runs on the render path. Release the status mutex during sleep;
++	// no input hook is allowed to advance this sequence. This conservative fix
++	// prioritizes stable frame ownership over early input-thread latency pacing.
+ 	const xell_context_handle_t sleepContext = xellContext_;
+ 	const uint32_t sleepPresentId = currentPresentId_;
+ 	a_lock.unlock();
+@@ -886,8 +883,7 @@
+ 			warnedMissingBeginFrame_ = true;
+ 			logger::warn("[XeSS-FG] TagFrame ran before BeginFrame; XeLL sleep is occurring later than intended");
+ 		}
+-		const uint64_t currentGlobalsFrame = GetGlobalsFrame(fallbackGlobalsFrame_);
+-		if (currentGlobalsFrame == lastGlobalsFrame_ || !StartFrameUnlocked(lock, currentGlobalsFrame))
++		if (!StartFrameUnlocked(lock, nextPresentId_))
+ 			return false;
+ 		// StartFrameUnlocked drops the lock around the XeLL sleep; re-check the XeFG context it
+ 		// re-validated only for XeLL before the rest of this function uses it.
+--- a/src/Features/Upscaling/IntelXeSSFrameGeneration.h
++++ b/src/Features/Upscaling/IntelXeSSFrameGeneration.h
+@@ -140,7 +140,7 @@
+ 	 */
+ 	bool SleepModeWouldChange(bool enabled, uint32_t minimumIntervalUs) const;
+ 
+-	/** Called before input sampling. Repeated calls during the same globals frame are ignored. */
++	/** Called on the render path. Repeated calls before matching AfterPresent are ignored. */
+ 	bool BeginFrame();
+ 	/**
+ 	 * Called when command recording for the frame starts. Closes the XeLL simulation phase and
+--- a/src/Features/Upscaling.cpp
++++ b/src/Features/Upscaling.cpp
+@@ -2289,9 +2289,12 @@
+ void Upscaling::Main_UpdateJitter::thunk(RE::BSGraphics::State* a_state)
+ {
+ 	auto& upscaling = globals::features::upscaling;
+-	// First per-frame render work the mod sees: the XeLL simulation phase ends here.
+-	if (upscaling.activeFrameGenerationMode == static_cast<uint>(FrameGenerationMethod::kXESS))
++	// Own the entire XeLL sequence on the render/present path. Input polling
++	// can run ahead while Present blocks and cannot own this single frame state.
++	if (upscaling.activeFrameGenerationMode == static_cast<uint>(FrameGenerationMethod::kXESS)) {
++		upscaling.intelXeSSFrameGeneration.BeginFrame();
+ 		upscaling.intelXeSSFrameGeneration.BeginRenderSubmit();
++	}
+ 	upscaling.ConfigureTAA();
+ 	func(a_state);
+ 	upscaling.ConfigureUpscaling(a_state);
+--- a/src/Hooks.cpp
++++ b/src/Hooks.cpp
+@@ -531,9 +531,8 @@
+ 		// Reflex sleep/cap runs here by design: this executes before rendering work for the frame.
+ 		// UpdateReflex() enforces "once per frame" internally in case this hook is hit multiple times.
+ 		globals::features::upscaling.streamline.UpdateReflex();
+-		auto& upscaling = globals::features::upscaling;
+-		if (upscaling.activeFrameGenerationMode == static_cast<uint>(Upscaling::FrameGenerationMethod::kXESS))
+-			upscaling.intelXeSSFrameGeneration.BeginFrame();
++		// XeLL is started by the render hook. Input polling may overlap Present on
++		// another thread and must not advance its frame ID or close its markers.
+ 
+ 		bool blockedDevice = true;
+ 

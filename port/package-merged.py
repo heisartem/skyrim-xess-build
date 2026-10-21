@@ -21,6 +21,8 @@ def tracked(repo):
             if path.is_file() and "Community Shaders Logo" not in path.parts:
                 yield path
 files = list(tracked(root))
+if (root / "_harness/fixes").exists():
+    shutil.copytree(root / "_harness/fixes", docs / "fixes", dirs_exist_ok=True)
 for path in files:
     if any(t in path.name.lower() for t in ("license", "copying", "exception", "notice")):
         dest = docs / "licenses" / path.relative_to(root)
