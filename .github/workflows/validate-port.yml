@@ -1,0 +1,32 @@
+name: Validate XeSS port to 1.9.1
+on:
+  push:
+    branches: [xess-on-1.9.1]
+    paths: ['port/**', '.github/workflows/validate-port.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  merge-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: community-shaders/skyrim-community-shaders
+          ref: 265c28f53767e94dac1c0c3b211a0aa37d8ec396
+          fetch-depth: 0
+          path: source
+          persist-credentials: false
+      - name: Merge pinned PR and validate resolutions
+        working-directory: source
+        run: python ../harness/port/merge-xess.py
+      - name: Record scope
+        run: |
+          echo '### Source merge validation only' >> "$GITHUB_STEP_SUMMARY"
+          echo 'MSVC compilation and runtime cache / FG performance validation are still pending.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'No binaries or restricted branding are published by this job.' >> "$GITHUB_STEP_SUMMARY"
