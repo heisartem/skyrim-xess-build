@@ -52,7 +52,13 @@ for name in sorted(conflicts):
     git("add", "--", name)
 
 assert not git("diff", "--name-only", "--diff-filter=U").stdout.strip()
-git("diff", "--cached", "--check")
+# Upstream notices may contain whitespace flagged by Git. Preserve them verbatim.
+whitespace = git("diff", "--cached", "--check", check=False)
+if whitespace.returncode:
+    print("Upstream whitespace diagnostics (not a compiler result):", whitespace.stdout)
+markers = git("grep", "--cached", "-n", "-I", "-E", r"^(<<<<<<< |>>>>>>> )", check=False)
+assert markers.returncode == 1, ("Unresolved conflict markers", markers.stdout)
+git("diff", "--cached", "--check", "--", *sorted(expected))
 for lang in ("en", "ru", "zh_CN"):
     json.loads(pathlib.Path("package/SKSE/Plugins/CommunityShaders/Translations/" + lang + ".json").read_text(encoding="utf-8"))
 up = pathlib.Path("src/Features/Upscaling.cpp").read_text(encoding="utf-8")
